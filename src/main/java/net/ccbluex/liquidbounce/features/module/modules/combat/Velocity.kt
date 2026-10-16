@@ -37,9 +37,14 @@ import net.minecraft.network.play.client.*
 import net.minecraft.network.play.client.C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK
 import net.minecraft.network.play.client.C0BPacketEntityAction.Action.*
 import net.minecraft.network.play.server.S08PacketPlayerPosLook
+import net.minecraft.network.play.server.S01PacketPong
 import net.minecraft.network.play.server.S12PacketEntityVelocity
 import net.minecraft.network.play.server.S27PacketExplosion
 import net.minecraft.network.play.server.S32PacketConfirmTransaction
+import net.minecraft.network.play.server.S3BPacketScoreboardObjective
+import net.minecraft.network.play.server.S3CPacketUpdateScore
+import net.minecraft.network.play.server.S3DPacketDisplayScoreboard
+import net.minecraft.network.play.server.S3EPacketTeams
 import net.minecraft.util.AxisAlignedBB
 import net.minecraft.util.BlockPos
 import net.minecraft.util.EnumFacing.DOWN
@@ -60,7 +65,8 @@ private val VELOCITY_MODES = arrayOf(
     "IntaveReduce", "Intave", "Delay", "Delayed", "Grim", "GrimC03", "Grim1.17", "GrimC07", "GrimDamage",
     "Hypixel", "HypixelAir", "HypixelBoost",
     "Click", "BlocksMC", "GrimVertical", "AttackReduce", "Spoof", "Tick", "AAC4Reduce", "AAC5Reduce",
-    "AAC5.2.0", "AAC5.2.0Combat", "Cancel", "Minemen", "Phase", "SideStrafe", "Polar", "Sentinel"
+    "AAC5.2.0", "AAC5.2.0Combat", "Cancel", "Minemen", "Phase", "SideStrafe", "Polar", "Sentinel",
+    "Watchdog"
 )
 
 /**
@@ -82,8 +88,19 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
 
     private val modeValue = choices("Mode", VELOCITY_MODES.copyOf(), "Simple")
         .describe("Knockback method. Legacy modes outside the selected profile are not presented as bypasses.")
-        .apply { onChanged { if (state) warnAboutMode(it) } }
     private val mode by modeValue
+
+    /**
+     * Single entry point for the Watchdog mode. Every option gate and handler asks this instead of
+     * comparing the mode string itself, so the mode cannot be half-applied by a comparison that was
+     * missed somewhere.
+     */
+    private val isWatchdogMode
+        get() = mode.equals("Watchdog", true)
+
+    init {
+        modeValue.onChanged { if (state) warnAboutMode(it) }
+    }
 
     private val horizontal by float("Horizontal", 0F, -1F..1F) { mode in arrayOf("Simple", "AAC", "Legit", "Tick") }
         .describe("Horizontal knockback multiplier.")
@@ -175,6 +192,18 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
 
     // Memory leak fix: Limit maximum packet queue size
     private const val MAX_PACKET_QUEUE = 100
+
+    // Watchdog: upper bound of the held backlog. A hold can never outlive the air window, so this
+    // only ever trips when the server floods the client, and it keeps the queue from growing into
+    // a multi-second packet stall.
+    private const val MAX_WATCHDOG_HELD_PACKETS = 64
+
+    // Watchdog: how long a jump-reset opportunity is kept before it is dropped.
+    private const val JUMP_HOLD_TICKS = 14
+
+    // Watchdog: how far the crosshair may be from the knockback direction and still count as
+    // facing it, which is what lets the delay end early.
+    private const val WATCHDOG_FACING_TOLERANCE = 15F
 
     // IntaveReduce
     private val reduceFactor by float("Factor", 0.6f, 0.6f..1f) { mode == "IntaveReduce" }
@@ -290,6 +319,73 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
     private val swingMode by choices("SwingMode", arrayOf("Off", "Normal", "Packet"), "Normal") { mode == "Click" }
         .describe("How to swing when clicking in Click mode.")
 
+    // Watchdog
+    // Jump reset: hold the knockback packet, then jump on the first tick the vanilla jump segment
+    // can actually fire, so the sprint bonus eats the horizontal knockback. Timing adds a real
+    // millisecond offset on top of that, mirroring the reference client's "Timing Min/MS Max MS".
+    private val watchdogJumpReset by boolean("WatchdogJumpReset", true) { isWatchdogMode }
+        .describe("Hold the knockback and jump on the first tick the vanilla jump segment can fire.")
+    private val watchdogTimingMin by float("WatchdogTimingMinMS", 0F, 0F..1000F) { isWatchdogMode }
+        .describe("Minimum delay in milliseconds between receiving the knockback and jumping.")
+    private val watchdogTimingMax by float("WatchdogTimingMaxMS", 0F, 0F..1000F) { isWatchdogMode }
+        .describe("Maximum delay in milliseconds between receiving the knockback and jumping.")
+    private val watchdogJumpChance by int("WatchdogJumpChance", 100, 0..100, "%") { isWatchdogMode }
+        .describe("Chance that a hit uses the jump reset at all; the roll happens once per hit.")
+    private val watchdogAutoAttack by boolean("WatchdogAutoAttack", true) { isWatchdogMode }
+        .describe("Swing at the target when the held knockback is released.")
+    private val watchdogAttackRange by float("WatchdogAttackRange", 3F, 1F..6F) { isWatchdogMode }
+        .describe("Reach used to find a target for the release swing.")
+
+    // Watchdog - Delay
+    private val watchdogDelay by boolean("WatchdogDelay", true) { isWatchdogMode }
+        .describe("Withhold the knockback together with the packets around it instead of applying it at once.")
+    private val watchdogDelayMode by choices(
+        "WatchdogDelayMode", arrayOf("DelayMin-max", "DelayTillGround"), "DelayMin-max"
+    ) { isWatchdogMode }
+        .describe("DelayMin-max waits a random number of ticks; DelayTillGround keeps the knockback until you land.")
+    private val watchdogDelayMin by int("WatchdogDelayMinTicks", 2, 1..20, "ticks") {
+        isWatchdogMode && watchdogDelayMode == "DelayMin-max"
+    }
+        .describe("Minimum ticks to hold the knockback for each hit.")
+    private val watchdogDelayMax by int("WatchdogDelayMaxTicks", 4, 1..20, "ticks") {
+        isWatchdogMode && watchdogDelayMode == "DelayMin-max"
+    }
+        .describe("Maximum ticks to hold the knockback for each hit.")
+    private val watchdogDelayChance by int("WatchdogDelayChance", 100, 0..100, "%") { isWatchdogMode }
+        .describe("Chance that a hit uses the delay at all; the roll happens once per hit.")
+    private val watchdogMaxAirDelayTicks by int("WatchdogMaxAirDelayTicks", 13, 1..40, "ticks") {
+        isWatchdogMode && watchdogDelayMode == "DelayTillGround"
+    }
+        .describe("Longest time the knockback may stay airborne before it is released anyway.")
+
+    // Watchdog - AttackReduce
+    private val watchdogAttackReduce by boolean("WatchdogAttackReduce", false) { isWatchdogMode }
+        .describe("Cut the knockback further by attacking inside the hurt-time window.")
+    private val watchdogAttackMin by int("WatchdogAttackMin", 1, 1..10) {
+        isWatchdogMode && watchdogAttackReduce
+    }
+        .describe("Minimum attacks spent per hit.")
+    private val watchdogAttackMax by int("WatchdogAttackMax", 2, 1..10) {
+        isWatchdogMode && watchdogAttackReduce
+    }
+        .describe("Maximum attacks spent per hit.")
+    private val watchdogHurtTimeMin by int("WatchdogHurtTimeMin", 7, 0..10) {
+        isWatchdogMode && watchdogAttackReduce
+    }
+        .describe("Earliest hurt-time tick an attack may happen on.")
+    private val watchdogHurtTimeMax by int("WatchdogHurtTimeMax", 10, 0..10) {
+        isWatchdogMode && watchdogAttackReduce
+    }
+        .describe("Latest hurt-time tick an attack may happen on.")
+    private val watchdogAttackRangeValue by float("WatchdogAttackReduceRange", 3F, 1F..6F) {
+        isWatchdogMode && watchdogAttackReduce
+    }
+        .describe("Reach used to find a target for the knockback-cutting attacks.")
+    // Mirrors the Click mode option the user compared this to: while blocking (or while an aura
+    // reports a block status) the extra attacks are skipped, while everything else keeps working.
+    private val watchdogIgnoreBlock by boolean("WatchdogIgnoreBlock", false) { isWatchdogMode }
+        .describe("Skip the knockback-cutting attacks while you are blocking.")
+
     private val generalGroup = Configurable("General")
     private val reverseGroup = Configurable("Reverse")
     private val aacGroup = Configurable("AAC")
@@ -298,6 +394,9 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
     private val tickGroup = Configurable("Tick")
     private val grimGroup = Configurable("Grim")
     private val miscGroup = Configurable("Misc")
+    // Named after the mode it belongs to. A leaf and its container may share a name here:
+    // findDeep resolves the mode value first, and the ClickGUI addresses groups by object.
+    private val watchdogVelocityGroup = Configurable("Watchdog")
 
     init {
         moveValues(generalGroup,
@@ -336,9 +435,30 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
             "Clicks", "HurtTimeToClick", "WhenFacingEnemyOnly", "IgnoreBlocking", "ClickRange",
             "SwingMode")
 
+        moveValues(watchdogVelocityGroup,
+            "WatchdogJumpReset", "WatchdogTimingMinMS", "WatchdogTimingMaxMS", "WatchdogJumpChance",
+            "WatchdogAutoAttack", "WatchdogAttackRange",
+            "WatchdogDelay", "WatchdogDelayMode", "WatchdogDelayMinTicks", "WatchdogDelayMaxTicks",
+            "WatchdogDelayChance", "WatchdogMaxAirDelayTicks",
+            "WatchdogAttackReduce", "WatchdogAttackMin", "WatchdogAttackMax", "WatchdogHurtTimeMin",
+            "WatchdogHurtTimeMax", "WatchdogAttackReduceRange", "WatchdogIgnoreBlock")
+
+        group(watchdogVelocityGroup, "Jump Reset",
+            "WatchdogJumpReset", "WatchdogTimingMinMS", "WatchdogTimingMaxMS",
+            "WatchdogJumpChance", "WatchdogAutoAttack", "WatchdogAttackRange")
+
+        val watchdogDelayGroup = group(watchdogVelocityGroup, "Delay",
+            "WatchdogDelay", "WatchdogDelayMode", "WatchdogDelayChance")
+        group(watchdogDelayGroup, "DelayMin-max", "WatchdogDelayMinTicks", "WatchdogDelayMaxTicks")
+        group(watchdogDelayGroup, "DelayTillGround", "WatchdogMaxAirDelayTicks")
+
+        group(watchdogVelocityGroup, "AttackReduce",
+            "WatchdogAttackReduce", "WatchdogAttackMin", "WatchdogAttackMax", "WatchdogHurtTimeMin",
+            "WatchdogHurtTimeMax", "WatchdogAttackReduceRange", "WatchdogIgnoreBlock")
+
         addValues(listOf(
             generalGroup, reverseGroup, aacGroup, jumpGroup, delayGroup, tickGroup,
-            grimGroup, miscGroup,
+            grimGroup, miscGroup, watchdogVelocityGroup,
         ))
     }
     /**
@@ -404,6 +524,33 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
     // Pause On Explosion
     private var pauseTicks = 0
 
+    // Watchdog
+    // Packets withheld from the server until the knockback is allowed to land. The list is only
+    // touched on the main thread, so a plain MutableList is enough. The flags below are read by the
+    // packet handler, which the network thread feeds, while the tick handler writes them, so they
+    // have to be visible across those threads without waiting for a later flush.
+    private val watchdogHeldPackets = mutableListOf<Packet<*>>()
+
+    @Volatile
+    private var watchdogHolding = false
+
+    @Volatile
+    private var watchdogReleasing = false
+
+    @Volatile
+    private var watchdogHeldEntityId = -1
+    private var watchdogHoldTicks = 0
+    private var watchdogAirTicks = 0
+    private var watchdogVelocityYaw = 0F
+    private var watchdogDelayActive = false
+    private var watchdogPendingJump = false
+    private var watchdogJumpWindowTicks = 0
+    private var watchdogJumpDeadlineNanos = 0L
+    private var watchdogLastHurtTime = 0
+    private var watchdogAttackCycle = false
+    private var watchdogAttacksLeft = 0
+    private var watchdogAttackedThisTick = false
+
     override val tag
         get() = if (mode == "Simple" || mode == "Legit") {
             val horizontalPercentage = (horizontal * 100).toInt()
@@ -438,6 +585,9 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         minemenTicks = 0
         minemenLastCancel = false
         minemenCanCancel = false
+        // Never leave the knockback sitting in our queue: a disabled module must not silently eat it.
+        flushWatchdogHeldPackets()
+        resetWatchdogVelocity()
         val shouldUnblink = delayedBlinkActive
         delayedPackets.clear()
         delayedBlinkActive = false
@@ -865,7 +1015,7 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
 
         mc.theWorld ?: return@handler
 
-        if (mode != "Click" || thePlayer.hurtTime != hurtTimeToClick || ignoreBlocking && (thePlayer.isBlocking || KillAura.blockStatus))
+        if (mode != "Click" || thePlayer.hurtTime != hurtTimeToClick || ignoreBlocking && isBlockingNow())
             return@handler
 
         var entity = mc.objectMouseOver?.entityHit
@@ -905,6 +1055,11 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
     val onAttack = handler<AttackEvent> {
         val player = mc.thePlayer ?: return@handler
 
+        if (isWatchdogMode) {
+            handleWatchdogAttackReduce(player)
+            return@handler
+        }
+
         if (mode == "AttackReduce") {
             if (player.hurtTime >= 3) {
                 player.motionX *= attackReduceAmount.toDouble()
@@ -943,6 +1098,41 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         return true
     }
 
+    val onWatchdogPacket = handler<PacketEvent>(priority = -1) { event ->
+        val thePlayer = mc.thePlayer ?: return@handler
+
+        if (!isWatchdogMode || handleEvents().not() || watchdogReleasing || event.isCancelled) {
+            return@handler
+        }
+
+        val packet = event.packet
+
+        if (watchdogHolding) {
+            if (!watchdogHoldsPacket(packet) || watchdogHeldPackets.size >= MAX_WATCHDOG_HELD_PACKETS) {
+                return@handler
+            }
+
+            // Keep the backlog ordered: the freshly received knockback belongs directly behind the
+            // knockback that is still being held, so replaying the backlog keeps every packet in the
+            // order the server sent it. Prepending here would reverse the knockbacks of a burst of
+            // hits and hand the oldest one to the client last.
+            if (packet is S12PacketEntityVelocity && packet.entityID == watchdogHeldEntityId) {
+                watchdogHeldPackets.add(watchdogHeldVelocityCount(), packet)
+            } else {
+                watchdogHeldPackets += packet
+            }
+
+            event.cancelEvent()
+        } else if (packet is S12PacketEntityVelocity &&
+            packet.entityID == thePlayer.entityId &&
+            beginWatchdogHold(packet, thePlayer)
+        ) {
+            watchdogHeldEntityId = thePlayer.entityId
+            watchdogHeldPackets += packet
+            event.cancelEvent()
+        }
+    }
+
     val onPacket = handler<PacketEvent>(priority = 1) { event ->
         val thePlayer = mc.thePlayer ?: return@handler
 
@@ -965,6 +1155,12 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         }
 
         if (shouldBlockLegacyVelocity(thePlayer)) {
+            // A guard such as OnlyGround or RespectSetbacks turned the mode off for this tick:
+            // release anything still queued so the knockback is never swallowed.
+            if (isWatchdogMode) {
+                flushWatchdogHeldPackets()
+                resetWatchdogVelocity()
+            }
             return@handler
         }
 
@@ -1013,6 +1209,15 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
             }
 
             when (mode.lowercase()) {
+                // The knockback of a held hit is replayed by the release above, which only dispatches
+                // the packet again; this handler is what marks the jump-reset window, so it has to
+                // accept the replayed packet as well (the hold branch above ignores it).
+                "watchdog" -> {
+                    if (packet is S12PacketEntityVelocity && packet.entityID == thePlayer.entityId) {
+                        beginWatchdogHitCycle()
+                    }
+                }
+
                 "simple" -> handleVelocity(event)
 
                 "aac", "reverse", "smoothreverse", "aaczero", "ghostblock", "intavereduce" -> hasReceivedVelocity = true
@@ -1402,6 +1607,54 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
     }
 
     /**
+     * Watchdog - delay release and jump reset.
+     *
+     * Runs once per client tick. The knockback is only handed back to the client here, so the whole
+     * hit is processed by the vanilla movement code in the same tick the release decision is made.
+     */
+    val onWatchdogTick = handler<GameTickEvent> {
+        val player = mc.thePlayer ?: return@handler
+
+        if (!isWatchdogMode) {
+            if (watchdogHolding) {
+                flushWatchdogHeldPackets()
+            }
+            resetWatchdogVelocity()
+            return@handler
+        }
+
+        if (!handleEvents() || player.isDead) {
+            flushWatchdogHeldPackets()
+            resetWatchdogVelocity()
+            return@handler
+        }
+
+        watchdogAttackedThisTick = false
+
+        if (watchdogHolding) {
+            watchdogAirTicks = if (player.onGround) 0 else watchdogAirTicks + 1
+
+            val maxAirDelay = watchdogMaxAirDelayTicks.coerceAtLeast(1)
+            val pastMinTicks = ++watchdogHoldTicks > watchdogDelayMin.coerceAtLeast(1)
+            if (pastMinTicks && player.onGround) {
+                releaseWatchdogVelocity(player)
+            } else if (pastMinTicks && isFacingKnockback(player)) {
+                // Turning into the knockback is what a player does right after being hit, so it is
+                // also the moment the withheld knockback may be handed back.
+                releaseWatchdogVelocity(player)
+            } else if (watchdogAirTicks >= maxAirDelay) {
+                // Mirror of the reference client's air time cutoff: never keep the knockback longer
+                // than the configured number of airborne ticks.
+                releaseWatchdogVelocity(player)
+            }
+        } else {
+            watchdogAirTicks = 0
+        }
+
+        updateWatchdogJumpReset(player)
+    }
+
+    /**
      * Tick Event (Abuse Timer Balance)
      */
     val onTick = handler<GameTickEvent> {
@@ -1489,6 +1742,8 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         delayedVelocityTick = -1
         sideStrafePos = null
         grimC07GotVelocity = false
+        flushWatchdogHeldPackets()
+        resetWatchdogVelocity()
         if (shouldUnblink && BlinkUtils.isBlinking) {
             BlinkUtils.unblink()
         }
@@ -1600,6 +1855,310 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         }
     }
 
+    // ===== Watchdog =====
+    //
+    // The mode withholds the knockback packet (and everything that would be applied behind it) from
+    // the vanilla handler, then hands the whole backlog back on the first tick the configured
+    // condition is met. Holding the S12 also keeps the server and the client in sync, because the
+    // transaction packets that would otherwise drift away travel with it.
+
+    /**
+     * Packets that belong to the withheld knockback window: every play-state packet except the
+     * scoreboard family, which the client must keep receiving while the hit is being held.
+     */
+    private fun watchdogHoldsPacket(packet: Packet<*>): Boolean {
+        if (packet is S01PacketPong ||
+            packet is S3BPacketScoreboardObjective ||
+            packet is S3CPacketUpdateScore ||
+            packet is S3DPacketDisplayScoreboard ||
+            packet is S3EPacketTeams
+        ) {
+            return false
+        }
+
+        return packet.javaClass.name.startsWith("net.minecraft.network.play.server.")
+    }
+
+    /** How many knockbacks of the player are already waiting in the backlog. */
+    private fun watchdogHeldVelocityCount(): Int =
+        watchdogHeldPackets.count { it is S12PacketEntityVelocity && it.entityID == watchdogHeldEntityId }
+
+    /**
+     * Decides whether this hit is withheld. The delay roll happens exactly once per hit and only
+     * when a tick window can be waited out, so the knockback is never kept without a plan.
+     */
+    private fun beginWatchdogHold(packet: S12PacketEntityVelocity, player: net.minecraft.client.entity.EntityPlayerSP): Boolean {
+        if (!watchdogDelay || watchdogDelayChance <= 0) {
+            return false
+        }
+
+        // A recent correction means the server already disagreed with our movement: withhold nothing
+        // until the situation settles so the delay can never be what caused the setback.
+        if (ServerObserver.hasRecentLagBack) {
+            return false
+        }
+
+        // World join and respawn traffic is not worth delaying, and the reference implementation
+        // waits for the player to exist for a while before it manipulates the knockback at all.
+        if (player.ticksExisted < 20) {
+            return false
+        }
+
+        if (watchdogDelayChance < 100 && nextInt(1, 101) > watchdogDelayChance) {
+            return false
+        }
+
+        val tillGround = watchdogDelayMode == "DelayTillGround"
+        if (!tillGround && !player.onGround) {
+            // A tick window measured in ticks cannot be honoured in mid air, and the air window that
+            // would be used instead is only configured for DelayTillGround.
+            return false
+        }
+
+        watchdogHolding = true
+        watchdogHoldTicks = 0
+        // The air window belongs to this hit: a player who was already airborne when the knockback
+        // arrived must still get the full allowance, otherwise the hold would end immediately.
+        watchdogAirTicks = 0
+        watchdogDelayActive = true
+        // Only the player's own knockback is ever queued, so the backlog starts clean per hold.
+        watchdogHeldEntityId = player.entityId
+        watchdogVelocityYaw = velocityDirectionYaw(packet)
+        return true
+    }
+
+    /** Hit cycle bookkeeping. Survives the hold, so a replayed S12 opens the same window. */
+    private fun beginWatchdogHitCycle() {
+        if (!watchdogJumpReset) {
+            clearWatchdogJumpWindow()
+            return
+        }
+
+        // The chance belongs to the hit, not to the tick: rolling it inside the window would let a
+        // low percentage succeed anyway, because the window retries on every tick it stays open.
+        if (watchdogJumpChance <= 0 || (watchdogJumpChance < 100 && nextInt(1, 101) > watchdogJumpChance)) {
+            clearWatchdogJumpWindow()
+            return
+        }
+
+        val jumpDelay = randomBetween(watchdogTimingMin, watchdogTimingMax)
+        watchdogPendingJump = true
+        // Hold the chance until the vanilla jump segment can really fire, which mirrors a player
+        // keeping the space bar pressed after taking a hit.
+        watchdogJumpWindowTicks = JUMP_HOLD_TICKS
+        watchdogJumpDeadlineNanos = if (jumpDelay <= 0F) 0L else System.nanoTime() + (jumpDelay * 1_000_000F).toLong()
+    }
+
+    private fun updateWatchdogJumpReset(player: net.minecraft.client.entity.EntityPlayerSP) {
+        if (!watchdogPendingJump) {
+            return
+        }
+
+        if (!watchdogJumpReset) {
+            clearWatchdogJumpWindow()
+            return
+        }
+
+        if (watchdogJumpWindowTicks <= 0) {
+            // The window ran out, so the opportunity is dropped as a whole instead of leaving a
+            // pending flag (or a deadline) behind for an unrelated tick to trip over.
+            clearWatchdogJumpWindow()
+            return
+        }
+
+        watchdogJumpWindowTicks--
+
+        if (watchdogJumpDeadlineNanos > 0L) {
+            if (System.nanoTime() < watchdogJumpDeadlineNanos) {
+                return
+            }
+
+            watchdogJumpDeadlineNanos = 0L
+        }
+
+        // The vanilla jump segment only fires with onGround set and a spent cooldown, so waiting for
+        // the same condition keeps the jump indistinguishable from a legitimate one.
+        if (!player.onGround || player.jumpTicks != 0) {
+            return
+        }
+
+        player.tryJump()
+
+        // The opportunity is spent either way: checking the player's state right after the call is
+        // unreliable (vanilla only commits jumpTicks inside the movement update), while a wasted
+        // window would make the module jump on a later, unrelated tick.
+        clearWatchdogJumpWindow()
+    }
+
+    private fun clearWatchdogJumpWindow() {
+        watchdogPendingJump = false
+        watchdogJumpWindowTicks = 0
+        watchdogJumpDeadlineNanos = 0L
+    }
+
+    /** Hands the withheld backlog back to the client. */
+    private fun releaseWatchdogVelocity(player: net.minecraft.client.entity.EntityPlayerSP) {
+        val released = watchdogHolding && watchdogDelayActive
+        // The release is decided inside the tick handler, which runs before the movement update of
+        // the same tick: handing the packets over right away is what lets the client process the
+        // knockback (and the jump reset that follows it) in the tick the release was decided for.
+        // The deferred queue would only apply them after that tick's movement was already sent.
+        flushWatchdogHeldPackets(immediate = true)
+        watchdogDelayActive = false
+
+        if (released && watchdogAutoAttack) {
+            swingAtWatchdogTarget(player)
+        }
+    }
+
+    /**
+     * Replays the backlog and ends the hold.
+     *
+     * [immediate] applies the backlog right here instead of scheduling it for the next game loop
+     * pass, which is what the tick-time release needs: [GameTickEvent] runs before the movement
+     * update of its tick, so dispatching now makes the knockback part of that very movement step.
+     */
+    private fun flushWatchdogHeldPackets(immediate: Boolean = false) {
+        if (watchdogHeldPackets.isEmpty()) {
+            watchdogHolding = false
+            watchdogHoldTicks = 0
+            return
+        }
+
+        // Every replayed packet is dispatched again through the normal handlers, so keep the guard up
+        // for the whole replay to stop the hold branch from swallowing it a second time.
+        watchdogReleasing = true
+
+        val pending = watchdogHeldPackets.toList()
+        watchdogHeldPackets.clear()
+
+        // A ping response is measured against the moment it was requested: replaying a stale one
+        // would only corrupt the latency reading.
+        val replayable = pending.filterNot { it is S01PacketPong }
+
+        if (replayable.isNotEmpty()) {
+            if (immediate) {
+                PacketUtils.handlePackets(replayable)
+            } else {
+                PacketUtils.schedulePacketProcess(replayable)
+            }
+        }
+
+        watchdogHolding = false
+        watchdogHoldTicks = 0
+        watchdogAirTicks = 0
+        watchdogReleasing = false
+    }
+
+    /**
+     * Drops every piece of Watchdog state. Any packet that is still on hold is discarded here
+     * instead of replayed: a reset means "this knockback is not ours to manipulate any more", and
+     * leaving an entry behind would make it the backlog of the next, unrelated hit.
+     */
+    private fun resetWatchdogVelocity() {
+        watchdogHeldPackets.clear()
+        watchdogHeldEntityId = -1
+        watchdogHolding = false
+        watchdogHoldTicks = 0
+        watchdogAirTicks = 0
+        watchdogDelayActive = false
+        clearWatchdogJumpWindow()
+        watchdogLastHurtTime = 0
+        watchdogAttackCycle = false
+        watchdogAttacksLeft = 0
+        watchdogAttackedThisTick = false
+        watchdogVelocityYaw = 0F
+    }
+
+    /** Direction the knockback pushes towards, normalised to [-180, 180]. */
+    private fun velocityDirectionYaw(packet: S12PacketEntityVelocity): Float {
+        val yaw = Math.toDegrees(atan2(packet.motionZ.toDouble(), packet.motionX.toDouble())).toFloat()
+        return when {
+            yaw < -180F -> yaw + 360F
+            yaw > 180F -> yaw - 360F
+            else -> yaw
+        }
+    }
+
+    private fun isFacingKnockback(player: net.minecraft.client.entity.EntityPlayerSP): Boolean {
+        var yaw = player.rotationYaw % 360F
+        if (yaw < -180F) yaw += 360F
+        if (yaw > 180F) yaw -= 360F
+
+        val difference = abs(yaw - watchdogVelocityYaw)
+        return difference <= WATCHDOG_FACING_TOLERANCE || difference >= 360F - WATCHDOG_FACING_TOLERANCE
+    }
+
+    /**
+     * Knockback-cutting attacks. The attack budget is rolled once per hit and then spent across the
+     * hurt-time window, at most one attack per tick, so no two attack packets share a tick.
+     */
+    private fun handleWatchdogAttackReduce(player: net.minecraft.client.entity.EntityPlayerSP) {
+        if (!watchdogAttackReduce || watchdogAttackedThisTick) {
+            return
+        }
+
+        // Mirrors the Click mode option: while blocking the extra attacks are skipped, while the
+        // held knockback keeps flowing normally.
+        if (watchdogIgnoreBlock && isBlockingNow()) {
+            return
+        }
+
+        val hurtTime = player.hurtTime
+        // A new hit cycle is a rising edge of hurtTime, and also anything that arrives after the
+        // window drained completely: a second, smaller hit can otherwise land on a spent budget.
+        val newCycle = !watchdogAttackCycle || hurtTime > watchdogLastHurtTime || watchdogLastHurtTime <= 0
+        watchdogLastHurtTime = hurtTime
+
+        if (hurtTime <= 0) {
+            watchdogAttackCycle = false
+            watchdogAttacksLeft = 0
+            return
+        }
+
+        if (newCycle) {
+            watchdogAttackCycle = true
+            watchdogAttacksLeft = randomBetween(watchdogAttackMin, watchdogAttackMax)
+        }
+
+        if (watchdogAttacksLeft <= 0) {
+            return
+        }
+
+        val hurtTimeLow = watchdogHurtTimeMin.coerceAtMost(watchdogHurtTimeMax)
+        val hurtTimeHigh = watchdogHurtTimeMin.coerceAtLeast(watchdogHurtTimeMax)
+        if (hurtTime !in hurtTimeLow..hurtTimeHigh) {
+            return
+        }
+
+        val target = findWatchdogTarget(player, watchdogAttackRangeValue) ?: return
+
+        // The attack only cuts knockback when it slows the player down, which is what sprinting
+        // attacks do, so keep the sprint handling identical to a normal hit.
+        player.attackEntityWithModifiedSprint(target, true) { player.swingItem() }
+        watchdogAttackedThisTick = true
+        watchdogAttacksLeft--
+    }
+
+    /** Swing at whatever the hit direction points at, so the release reads as a reaction. */
+    private fun swingAtWatchdogTarget(player: net.minecraft.client.entity.EntityPlayerSP) {
+        val target = findWatchdogTarget(player, watchdogAttackRange) ?: return
+        player.attackEntityWithModifiedSprint(target, true) { player.swingItem() }
+    }
+
+    private fun findWatchdogTarget(player: net.minecraft.client.entity.EntityPlayerSP, range: Float): Entity? {
+        mc.objectMouseOver?.entityHit?.let { if (isSelected(it, true)) return it }
+        return getNearestEntityInRange(range)?.takeIf { isSelected(it, true) }
+    }
+
+    private fun isBlockingNow(): Boolean = (mc.thePlayer?.isBlocking ?: false) || KillAura.blockStatus
+
+    private fun randomBetween(min: Float, max: Float): Float =
+        nextFloat(min.coerceAtMost(max), min.coerceAtLeast(max))
+
+    private fun randomBetween(min: Int, max: Int): Int =
+        nextInt(min.coerceAtMost(max), min.coerceAtLeast(max) + 1)
+
     private fun flushDelayedPackets(force: Boolean = false) {
         val now = System.currentTimeMillis()
 
@@ -1637,7 +2196,10 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         if (!force && fingerprint == lastProfileFingerprint) return
         lastProfileFingerprint = fingerprint
 
+        // The advisor falls back to the full list on its own, but an empty result must never reach
+        // the mode value: it would leave no selectable mode and `first()` below would throw.
         val available = AnticheatModeAdvisor.filteredModes("Velocity", antiCheat, observed, VELOCITY_MODES)
+            .takeIf { it.isNotEmpty() } ?: VELOCITY_MODES.copyOf()
         modeValue.updateValues(available)
         if (available.none { it.equals(mode, true) }) {
             val previous = mode
