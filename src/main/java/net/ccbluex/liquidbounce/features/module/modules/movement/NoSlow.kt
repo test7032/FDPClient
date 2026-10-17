@@ -882,12 +882,15 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
     /**
      * Advances the cadence at the head of the player update, which is before the vanilla input
      * scaling [onSlowDown] rewrites, so the ruling later in the same tick reads a current counter.
-     * Inactive use resets it, otherwise tapping the button repeatedly would keep restarting the
-     * count and never reach the tick that pays out.
+     *
+     * The counter only runs while the item is really in use, and stops the moment the use ends. The
+     * beat depends on that: the tick that pays out has to be reached from the start of the use, so
+     * the first tick of every block stays a slow one — merely holding the sword must not walk the
+     * counter into the fast tick of a later block.
      */
-    private val onPredictionUpdate = handler<UpdateEvent> {
+    val onPredictionUpdate = handler<UpdateEvent> {
         val player = mc.thePlayer ?: return@handler
-        if (!predictionActive(player.heldItem?.item)) {
+        if (!usingItemFunc() || !predictionActive(player.heldItem?.item)) {
             predictionTick = 0
             return@handler
         }
@@ -899,7 +902,7 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
      * tick leaves behind sits below the 0.8 forward threshold, so vanilla would always drop sprint
      * there; forcing it back keeps sprint on both kinds of tick.
      */
-    private val onPredictionSprint = handler<PostSprintUpdateEvent> {
+    val onPredictionSprint = handler<PostSprintUpdateEvent> {
         val player = mc.thePlayer ?: return@handler
         if (!predictionForceSprint || !predictionActive(player.heldItem?.item)) return@handler
         if (predictionSprintSafe(player)) player.isSprinting = true
@@ -924,7 +927,7 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
 
         item is ItemFood -> consumeMode == "Prediction" && consumeFoodOnly
 
-        item is ItemPotion, item is ItemBucketMilk -> consumeMode == "Prediction" && consumeDrinkOnly
+        item is ItemPotion || item is ItemBucketMilk -> consumeMode == "Prediction" && consumeDrinkOnly
 
         else -> false
     }
@@ -935,7 +938,7 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
      * Head of the tick. Takes the use snapshot the slowdown ruling reads, then either advances the
      * block cycle or tears the hold window down.
      */
-    private val onPrediction2Update = handler<UpdateEvent> {
+    val onPrediction2Update = handler<UpdateEvent> {
         val player = mc.thePlayer ?: return@handler
         if (swordMode != "Prediction2" && !blinkHolding && blinkPhase == BlinkPhase.NONE) return@handler
 
@@ -963,12 +966,12 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
      * Opens the hold window once this tick's own position packet is already on the wire, so the
      * packet that clears the server's blocking state is never itself held back.
      */
-    private val onPrediction2PostMotion = handler<MotionEvent> { event ->
+    val onPrediction2PostMotion = handler<MotionEvent> { event ->
         if (event.eventState != EventState.POST || swordMode != "Prediction2") return@handler
         if (!blinkHolding) tryStartBlink()
     }
 
-    private val onPrediction2Packet = handler<PacketEvent> { event ->
+    val onPrediction2Packet = handler<PacketEvent> { event ->
         if (event.eventType != EventState.SEND || event.isCancelled) return@handler
         if (swordMode != "Prediction2" && !blinkHolding) return@handler
 
@@ -1022,7 +1025,7 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
 
             packet is C09PacketHeldItemChange -> {
                 windowDirty = true
-                grimSlot = packet.heldItemHotbarIndex
+                grimSlot = packet.slotId
             }
 
             packet is C08PacketPlayerBlockPlacement -> windowDirty = true
@@ -1039,7 +1042,7 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
      * Knockback is resolved against a transaction boundary, so a frozen window must not be gambled
      * on: ending it immediately is cheaper than a desynced velocity prediction.
      */
-    private val onPrediction2Receive = handler<PacketEvent> { event ->
+    val onPrediction2Receive = handler<PacketEvent> { event ->
         if (event.eventType != EventState.RECEIVE || event.isCancelled || !blinkHolding) return@handler
 
         when (val packet = event.packet) {
@@ -1050,14 +1053,18 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
     }
 
     /** The queued packets belong to the old connection, so they are dropped rather than replayed. */
-    private val onPrediction2WorldChange = handler<WorldChangeEvent> {
+    val onPrediction2WorldChange = handler<WorldChangeEvent> {
         discardBlink()
         resetResync()
     }
 
-    /** True while a sword block owned by Prediction2 is up. */
+    /**
+     * True while a sword block owned by Prediction2 is up. Uses the module-wide [usingItemFunc]
+     * instead of the vanilla item-in-use flag so a block started by KillAura's auto block runs the
+     * cycle as well — every other sword mode already keys off that helper.
+     */
     private fun prediction2Active(player: net.minecraft.client.entity.EntityPlayerSP): Boolean =
-        swordMode == "Prediction2" && player.isUsingItem && player.heldItem?.item is ItemSword
+        swordMode == "Prediction2" && usingItemFunc() && player.heldItem?.item is ItemSword
 
     /**
      * Advances the block cycle by one tick.
@@ -1117,14 +1124,14 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
     /** Leaves the cycle cleanly, moving the server's slot back if the tick stopped on AWAY. */
     private fun stopResync() {
         val player = mc.thePlayer
-        val needCutBack = blinkRunning && blinkPhase == BlinkPhase.AWAY && player != null &&
+        val needCutBack = player != null && blinkRunning && blinkPhase == BlinkPhase.AWAY &&
             grimSlot != player.inventory.currentItem && !windowDirty
 
         blinkPhase = BlinkPhase.NONE
         blinkRunning = false
         blinkCyclePos = 0
 
-        if (needCutBack && player != null) sendSlot(player.inventory.currentItem)
+        if (needCutBack) sendSlot(player.inventory.currentItem)
     }
 
     private fun resetResync() {
@@ -1219,46 +1226,45 @@ object NoSlow : Module("NoSlow", Category.MOVEMENT, Category.SubCategory.MOVEMEN
     private fun flushBlink() {
         val out = drainBlink() ?: return
 
-        // A head release is only worth sending in front of a position packet, because that packet
-        // is what closes its window. A batch without one holds nothing that needs un-slowing, and
-        // releasing there would drop a block the player still has up.
-        var headRelease = out.isNotEmpty()
-        for (packet in out) {
-            if (packet is C03PacketPlayer) break
-            headRelease = false
-        }
-
-        dispatchFlush(out, headRelease)
+        // A head release is only worth sending when a position packet travels with it, because that
+        // packet is what closes the release's window. The position packet does not have to be the
+        // first entry of the batch — dispatchFlush hoists the tick's own action packets in front of
+        // it — so ask whether the batch carries one at all. A batch without one holds nothing that
+        // needs un-slowing, and releasing there would drop a block the player still has up.
+        dispatchFlush(out, out.any { it is C03PacketPlayer })
     }
 
+    /**
+     * Replays a drained batch in its original order.
+     *
+     * @param headRelease whether a release packet should open the batch. It is only worth sending
+     *                    in front of a position packet, since that is what closes its window.
+     */
     private fun dispatchFlush(out: MutableList<Packet<*>>, headRelease: Boolean) {
         var firstFlying = -1
 
         if (headRelease) {
             sendPacket(C07PacketPlayerDigging(RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN), false)
-
-            for (index in out.indices) {
-                if (out[index] is C03PacketPlayer) {
-                    firstFlying = index
-                    break
-                }
-            }
-
-            if (firstFlying >= 0) {
-                // Sprint and sneak toggles belong to the tick they were queued in: send them ahead
-                // of the position packet that closes the release window, otherwise that tick is
-                // predicted with the previous sprint state.
-                for (index in 0 until firstFlying) {
-                    if (out[index] is C0BPacketEntityAction) sendPacket(out[index], false)
-                }
-
-                sendPacket(out.removeAt(firstFlying), false)
-            }
+            firstFlying = out.indexOfFirst { it is C03PacketPlayer }
         }
 
-        for (index in out.indices) {
-            val packet = out[index]
-            if (firstFlying >= 0 && index < firstFlying && packet is C0BPacketEntityAction) continue
+        if (firstFlying < 0) {
+            // Nothing to close the release window with, so the batch just goes out in order.
+            for (packet in out) sendPacket(packet, false)
+            return
+        }
+
+        // Sprint and sneak toggles belong to the tick they were queued in: send them ahead of the
+        // position packet that closes the release window, otherwise that tick is predicted with the
+        // previous sprint state.
+        for (index in 0 until firstFlying) {
+            if (out[index] is C0BPacketEntityAction) sendPacket(out[index], false)
+        }
+
+        sendPacket(out.removeAt(firstFlying), false)
+
+        for ((index, packet) in out.withIndex()) {
+            if (index < firstFlying && packet is C0BPacketEntityAction) continue
             sendPacket(packet, false)
         }
     }
