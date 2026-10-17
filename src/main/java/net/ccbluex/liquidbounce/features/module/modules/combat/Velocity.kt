@@ -37,7 +37,6 @@ import net.minecraft.network.play.client.*
 import net.minecraft.network.play.client.C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK
 import net.minecraft.network.play.client.C0BPacketEntityAction.Action.*
 import net.minecraft.network.play.server.S08PacketPlayerPosLook
-import net.minecraft.network.play.server.S01PacketPong
 import net.minecraft.network.play.server.S12PacketEntityVelocity
 import net.minecraft.network.play.server.S27PacketExplosion
 import net.minecraft.network.play.server.S32PacketConfirmTransaction
@@ -45,6 +44,7 @@ import net.minecraft.network.play.server.S3BPacketScoreboardObjective
 import net.minecraft.network.play.server.S3CPacketUpdateScore
 import net.minecraft.network.play.server.S3DPacketDisplayScoreboard
 import net.minecraft.network.play.server.S3EPacketTeams
+import net.minecraft.network.status.server.S01PacketPong
 import net.minecraft.util.AxisAlignedBB
 import net.minecraft.util.BlockPos
 import net.minecraft.util.EnumFacing.DOWN
@@ -1213,7 +1213,11 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
                 // the packet again; this handler is what marks the jump-reset window, so it has to
                 // accept the replayed packet as well (the hold branch above ignores it).
                 "watchdog" -> {
-                    if (packet is S12PacketEntityVelocity && packet.entityID == thePlayer.entityId) {
+                    // The cycle is opened by the packet the client is actually allowed to process.
+                    // A replayed knockback is excluded here because [releaseWatchdogVelocity] opens
+                    // the cycle itself right after the backlog is handed over: that is what places
+                    // the jump min-max delay behind the release instead of behind the receive.
+                    if (!watchdogReleasing && packet is S12PacketEntityVelocity && packet.entityID == thePlayer.entityId) {
                         beginWatchdogHitCycle()
                     }
                 }
@@ -1927,7 +1931,16 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         return true
     }
 
-    /** Hit cycle bookkeeping. Survives the hold, so a replayed S12 opens the same window. */
+    /**
+     * The Watchdog hit cycle, in the order the mode is meant to run in:
+     *
+     *   delay knockback  ->  release  ->  jump min-max delay  ->  jump
+     *
+     * This is called when the hit actually reaches the client — the release tick of a hold, or the
+     * tick the packet arrives in when the delay is not used. The jump min-max delay is therefore
+     * always measured from the moment the knockback is on the client, never from the moment the
+     * packet was received, so a held hit cannot spend its jump delay while it is still withheld.
+     */
     private fun beginWatchdogHitCycle() {
         if (!watchdogJumpReset) {
             clearWatchdogJumpWindow()
@@ -1941,6 +1954,10 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
             return
         }
 
+        // The configured delay is a real millisecond offset, so it is carried in milliseconds and
+        // only the eligibility window that follows it is counted in ticks. Keeping the two apart is
+        // what makes the delay exact: a tick counter could not honour a delay longer than the window
+        // itself, it would simply run out and drop the jump before the delay was ever over.
         val jumpDelay = randomBetween(watchdogTimingMin, watchdogTimingMax)
         watchdogPendingJump = true
         // Hold the chance until the vanilla jump segment can really fire, which mirrors a player
@@ -1959,6 +1976,17 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
             return
         }
 
+        // The jump min-max delay comes first and is spent before anything else: until it is over the
+        // hit is not allowed to be jumped off at all, and the eligibility window below must not run
+        // down during it.
+        if (watchdogJumpDeadlineNanos > 0L) {
+            if (System.nanoTime() < watchdogJumpDeadlineNanos) {
+                return
+            }
+
+            watchdogJumpDeadlineNanos = 0L
+        }
+
         if (watchdogJumpWindowTicks <= 0) {
             // The window ran out, so the opportunity is dropped as a whole instead of leaving a
             // pending flag (or a deadline) behind for an unrelated tick to trip over.
@@ -1967,14 +1995,6 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         }
 
         watchdogJumpWindowTicks--
-
-        if (watchdogJumpDeadlineNanos > 0L) {
-            if (System.nanoTime() < watchdogJumpDeadlineNanos) {
-                return
-            }
-
-            watchdogJumpDeadlineNanos = 0L
-        }
 
         // The vanilla jump segment only fires with onGround set and a spent cooldown, so waiting for
         // the same condition keeps the jump indistinguishable from a legitimate one.
@@ -2006,7 +2026,16 @@ object Velocity : Module("Velocity", Category.COMBAT, Category.SubCategory.COMBA
         flushWatchdogHeldPackets(immediate = true)
         watchdogDelayActive = false
 
-        if (released && watchdogAutoAttack) {
+        if (!released) {
+            return
+        }
+
+        // This is the tick the hit really lands, so the jump cycle starts here and not when the
+        // packet was received: the min-max jump delay is a delay after the knockback has been
+        // handed back, which is what makes the sequence delay -> release -> jump delay -> jump.
+        beginWatchdogHitCycle()
+
+        if (watchdogAutoAttack) {
             swingAtWatchdogTarget(player)
         }
     }
