@@ -11,6 +11,7 @@ import net.ccbluex.liquidbounce.features.module.Module
 import net.ccbluex.liquidbounce.ui.client.clickgui.ClickGui
 import net.ccbluex.liquidbounce.ui.client.hud.designer.GuiHudDesigner
 import net.ccbluex.liquidbounce.utils.client.PacketUtils
+import net.ccbluex.liquidbounce.utils.client.pos
 import net.ccbluex.liquidbounce.utils.inventory.InventoryManager
 import net.ccbluex.liquidbounce.utils.inventory.InventoryManager.canClickInventory
 import net.ccbluex.liquidbounce.utils.inventory.InventoryManager.hasScheduledInLastLoop
@@ -21,6 +22,7 @@ import net.minecraft.client.gui.GuiChat
 import net.minecraft.client.gui.GuiIngameMenu
 import net.minecraft.client.gui.GuiScreen
 import net.minecraft.client.gui.inventory.GuiChest
+import net.minecraft.client.gui.inventory.GuiContainer
 import net.minecraft.client.gui.inventory.GuiInventory
 import net.minecraft.client.settings.GameSettings
 import net.minecraft.client.settings.KeyBinding
@@ -35,6 +37,8 @@ import net.minecraft.network.play.client.C16PacketClientStatus.EnumState.OPEN_IN
 import net.minecraft.network.play.server.S2DPacketOpenWindow
 import net.minecraft.network.play.server.S2EPacketCloseWindow
 import net.minecraft.potion.Potion
+import net.minecraft.util.BlockPos
+import net.minecraft.util.Vec3
 import org.lwjgl.input.Mouse
 
 @Suppress("TooManyFunctions")
@@ -123,7 +127,7 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
 
         Blinking,
 
-        WaitingToReopen
+        Reopening
     }
 
     private val reopenableBlocks = setOf(
@@ -143,6 +147,9 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
     )
 
     private const val REOPEN_TIMEOUT_MS = 2_000L
+    private const val CONTAINER_REACH_SQ = 64.0
+    private const val REOPEN_CONFIRM_TICKS = 30
+    private const val MAX_HELD_PACKETS = 240
 
     private val heldPackets = ArrayList<Packet<*>>()
 
@@ -151,6 +158,15 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
 
     @Volatile
     private var reopenPacket: Packet<*>? = null
+
+    @Volatile
+    private var containerPos: BlockPos? = null
+
+    @Volatile
+    private var serverPos: Vec3? = null
+
+    @Volatile
+    private var reopenWaitTicks = 0
 
     @Volatile
     private var lastContainerInteraction: C08PacketPlayerBlockPlacement? = null
@@ -344,14 +360,14 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
         if (!isBlinking) return@handler
 
         if (event.guiScreen == null) {
-            if (bufferPhase == BufferPhase.Blinking) stopBuffer(flush = true)
+            if (bufferPhase != BufferPhase.Idle) stopBuffer(flush = true)
             return@handler
         }
 
         if (event.guiScreen !is GuiInventory) return@handler
         if (bufferPhase != BufferPhase.Idle) return@handler
 
-        startBuffer(C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT), windowId = 0)
+        startBuffer(C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT), windowId = 0, container = null)
     }
 
     val onPacket = handler<PacketEvent> { event ->
@@ -396,7 +412,7 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
             when (packet) {
                 is S2DPacketOpenWindow -> onServerWindowOpened(packet)
 
-                is S2EPacketCloseWindow -> if (bufferPhase == BufferPhase.Blinking) stopBuffer(flush = true)
+                is S2EPacketCloseWindow -> stopBuffer(flush = true)
             }
             return
         }
@@ -406,18 +422,23 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
         if (packet is C08PacketPlayerBlockPlacement) rememberContainerInteraction(packet)
 
         if (packet is C0DPacketCloseWindow) {
-            if (bufferPhase == BufferPhase.Blinking) {
+            if (bufferPhase != BufferPhase.Idle) {
                 event.cancelEvent()
                 PacketUtils.sendPacket(packet, false)
                 stopBuffer(flush = true)
-            } else if (bufferPhase == BufferPhase.WaitingToReopen) {
-                event.cancelEvent()
             }
             return
         }
 
-        if (bufferPhase != BufferPhase.Blinking) return
-        if (!shouldHold(packet)) return
+        if (bufferPhase == BufferPhase.Idle) {
+            trackServerPosition(packet)
+            return
+        }
+
+        if (!shouldHold(packet) && !keepsContainerAlive(packet)) {
+            trackServerPosition(packet)
+            return
+        }
 
         event.cancelEvent()
         synchronized(heldPackets) { heldPackets += packet }
@@ -425,9 +446,31 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
         if (packet is C0EPacketClickWindow) clicksHeldThisTick = true
     }
 
+    private fun trackServerPosition(packet: Packet<*>) {
+        if (packet is C03PacketPlayer && packet.isMoving) serverPos = packet.pos
+    }
+
+    private fun keepsContainerAlive(packet: Packet<*>): Boolean {
+        val container = containerPos ?: return false
+        if (packet !is C03PacketPlayer || !packet.isMoving) return false
+
+        val known = serverPos ?: return false
+        if (distanceSq(known, container) > CONTAINER_REACH_SQ) return false
+
+        return distanceSq(packet.pos, container) > CONTAINER_REACH_SQ
+    }
+
+    private fun distanceSq(position: Vec3, block: BlockPos): Double {
+        val dx = position.xCoord - (block.x + 0.5)
+        val dy = position.yCoord - (block.y + 0.5)
+        val dz = position.zCoord - (block.z + 0.5)
+
+        return dx * dx + dy * dy + dz * dz
+    }
+
     private fun onServerWindowOpened(packet: S2DPacketOpenWindow) {
         if (packet.windowId == 0) {
-            startBuffer(C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT), 0)
+            startBuffer(C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT), 0, null)
             return
         }
 
@@ -435,21 +478,34 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
         val interaction = lastContainerInteraction
         val reusable = interaction != null && now - lastContainerInteractionTime <= REOPEN_TIMEOUT_MS
 
-        startBuffer(if (reusable) interaction else null, packet.windowId)
+        startBuffer(if (reusable) interaction else null, packet.windowId, interaction?.position)
     }
 
-    private fun startBuffer(reopen: Packet<*>?, windowId: Int) {
+    private fun startBuffer(reopen: Packet<*>?, windowId: Int, container: BlockPos?) {
         if (!isBlinking) return
 
         if (bufferPhase == BufferPhase.Idle) {
             synchronized(heldPackets) { heldPackets.clear() }
             elapsedTicks = 0
             clicksHeldThisTick = false
+            mc.thePlayer?.let { serverPos = Vec3(it.posX, it.posY, it.posZ) }
+        } else if (bufferPhase == BufferPhase.Reopening) {
+            synchronized(heldPackets) { heldPackets.removeAll { it is C0EPacketClickWindow } }
         }
 
         reopenPacket = reopen
         activeWindowId = windowId
+        containerPos = containerAt(container)
+        reopenWaitTicks = 0
         bufferPhase = BufferPhase.Blinking
+    }
+
+    private fun containerAt(position: BlockPos?): BlockPos? {
+        if (position == null) return null
+
+        val block = mc.theWorld?.getBlockState(position)?.block ?: return position
+
+        return if (block in reopenableBlocks || block === Blocks.air) position else null
     }
 
     private fun rememberContainerInteraction(packet: C08PacketPlayerBlockPlacement) {
@@ -488,13 +544,14 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
                 if (elapsedTicks >= blinkTicks) endBufferCycle()
             }
 
-            BufferPhase.WaitingToReopen -> {
-                if (reopenWindow()) {
-                    elapsedTicks = 0
-                    clicksHeldThisTick = false
-                    bufferPhase = BufferPhase.Blinking
-                } else {
+            BufferPhase.Reopening -> {
+                reopenWaitTicks++
+
+                if (reopenWaitTicks > REOPEN_CONFIRM_TICKS) {
+                    val open = mc.currentScreen
                     stopBuffer(flush = true)
+
+                    if (open is GuiContainer) mc.displayGuiScreen(null)
                 }
             }
 
@@ -503,9 +560,29 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
     }
 
     private fun endBufferCycle() {
-        val shouldClose = sendCloseWindow && reopenPacket != null
+        if (synchronized(heldPackets) { heldPackets.size } >= MAX_HELD_PACKETS) {
+            val outOfReach = heldMovementOutOfReach()
+            val open = mc.currentScreen
 
-        if (!shouldClose) {
+            flushHeld()
+            elapsedTicks = 0
+
+            if (outOfReach && open is GuiContainer) {
+                stopBuffer(flush = true)
+                mc.displayGuiScreen(null)
+            }
+            return
+        }
+
+        if (heldMovementOutOfReach()) {
+            flushHeldClicks()
+            elapsedTicks = 0
+            return
+        }
+
+        val reopen = reopenPacket
+
+        if (!sendCloseWindow || reopen == null || !canReopen(reopen)) {
             flushHeld()
             elapsedTicks = 0
             return
@@ -513,39 +590,61 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
 
         flushHeldClicks()
 
-        bufferPhase = BufferPhase.WaitingToReopen
+        PacketUtils.sendPacket(C0DPacketCloseWindow(activeWindowId), false)
+        sendReopen(reopen)
+
         elapsedTicks = 0
 
-        PacketUtils.sendPacket(C0DPacketCloseWindow(activeWindowId), false)
+        if (reopen is C08PacketPlayerBlockPlacement) {
+            bufferPhase = BufferPhase.Reopening
+            reopenWaitTicks = 0
+        }
 
         flushHeld()
     }
 
-    private fun reopenWindow(): Boolean {
-        val packet = reopenPacket ?: return false
+    private fun heldMovementOutOfReach(): Boolean {
+        val container = containerPos ?: return false
 
-        when (packet) {
-            is C16PacketClientStatus -> Unit
-            is C08PacketPlayerBlockPlacement -> {
-                val world = mc.theWorld ?: return false
-                if (world.getBlockState(packet.position).block !in reopenableBlocks) return false
-            }
-            else -> return false
+        val last = synchronized(heldPackets) {
+            heldPackets.lastOrNull { it is C03PacketPlayer && it.isMoving } as? C03PacketPlayer
+        } ?: return false
+
+        return distanceSq(last.pos, container) > CONTAINER_REACH_SQ
+    }
+
+    private fun canReopen(packet: Packet<*>): Boolean = when (packet) {
+        is C16PacketClientStatus -> true
+
+        is C08PacketPlayerBlockPlacement -> {
+            val world = mc.theWorld
+            val pos = packet.position
+            val known = serverPos ?: mc.thePlayer?.let { Vec3(it.posX, it.posY, it.posZ) }
+
+            if (world == null || pos == null || known == null) false
+            else world.getBlockState(pos).block in reopenableBlocks && distanceSq(known, pos) < CONTAINER_REACH_SQ
         }
 
+        else -> false
+    }
+
+    private fun sendReopen(packet: Packet<*>) {
         PacketUtils.sendPacket(packet, false)
 
         if (packet is C08PacketPlayerBlockPlacement) {
             lastContainerInteraction = packet
             lastContainerInteractionTime = System.currentTimeMillis()
         }
-
-        return true
     }
 
-    private fun flushHeld() = sendSilently(
-        synchronized(heldPackets) { heldPackets.toList().also { heldPackets.clear() } }
-    )
+    private fun flushHeld() {
+        val pending = synchronized(heldPackets) {
+            heldPackets.toList().also { heldPackets.clear() }
+        }
+
+        pending.forEach(::trackServerPosition)
+        sendSilently(pending)
+    }
 
     private fun takeHeldClicks(): List<Packet<*>> = synchronized(heldPackets) {
         val clicks = heldPackets.filterIsInstance<C0EPacketClickWindow>()
@@ -564,12 +663,17 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
         elapsedTicks = 0
         clicksHeldThisTick = false
         reopenPacket = null
+        containerPos = null
+        reopenWaitTicks = 0
 
         val pending = synchronized(heldPackets) {
             heldPackets.toList().also { heldPackets.clear() }
         }
 
-        if (flush) sendSilently(pending)
+        if (flush) {
+            pending.forEach(::trackServerPosition)
+            sendSilently(pending)
+        }
     }
 
     private fun syncBufferLifetime() {
@@ -585,6 +689,8 @@ object InvMove : Module("InvMove", Category.MOVEMENT, Category.SubCategory.MOVEM
             stopBuffer(flush = false)
             lastContainerInteraction = null
             lastContainerInteractionTime = 0L
+            containerPos = null
+            serverPos = null
         }
     }
 
